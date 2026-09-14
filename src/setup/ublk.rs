@@ -71,7 +71,7 @@ fn ensure_permissions(current_group: &str) -> Result<()> {
 
 pub fn provision(group: &str) -> Result<()> {
     if !ublk_module_loaded() {
-        install_apt_extra_kernel_modules();
+        install_extra_kernel_modules();
     }
     load_ublk_module()?;
     std::fs::create_dir_all("/etc/modules-load.d").context("create /etc/modules-load.d")?;
@@ -93,11 +93,7 @@ pub fn check() -> Result<()> {
     Ok(())
 }
 
-fn install_apt_extra_kernel_modules() {
-    if which::which("apt-get").is_err() {
-        return;
-    }
-
+fn install_extra_kernel_modules() {
     let uname = Command::new("uname")
         .args(["-r"])
         .output()
@@ -107,12 +103,29 @@ fn install_apt_extra_kernel_modules() {
         return;
     }
 
-    let pkg = format!("linux-modules-extra-{uname}");
-    if !Command::new("apt-get")
-        .args(["install", "-y", pkg.as_str()])
+    let (manager, package) = if which::which("apt-get").is_ok() {
+        ("apt-get", format!("linux-modules-extra-{uname}"))
+    } else if which::which("dnf").is_ok() || which::which("yum").is_ok() {
+        (
+            if which::which("dnf").is_ok() {
+                "dnf"
+            } else {
+                "yum"
+            },
+            format!("kernel-modules-extra-{uname}"),
+        )
+    } else {
+        return;
+    };
+
+    if !Command::new(manager)
+        .args(["install", "-y", package.as_str()])
         .status()
         .is_ok_and(|status| status.success())
     {
-        warn!("extra kernel modules not found via apt for this kernel");
+        warn!(
+            manager,
+            package, "extra kernel modules not found for this kernel"
+        );
     }
 }

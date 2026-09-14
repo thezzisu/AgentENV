@@ -261,7 +261,9 @@ fn distro_from_id(id: &str) -> Option<Distro> {
         "centos" | "centos-stream" | "tencentos" | "openeuler" | "openEuler" => {
             Some(Distro::Centos)
         }
-        "rhel" | "redhat" | "redhatenterpriseserver" => Some(Distro::Rhel),
+        // Fedora uses the same RPM package ecosystem and runtime package
+        // mappings as RHEL-compatible distributions.
+        "fedora" | "rhel" | "redhat" | "redhatenterpriseserver" => Some(Distro::Rhel),
         "arch" | "manjaro" => Some(Distro::Arch),
         _ => None,
     }
@@ -529,6 +531,12 @@ mod tests {
     #[test]
     fn parses_rhel_like_os_release() {
         let os_release = "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n";
+        assert_eq!(os_release_distro(os_release), Some(Distro::Rhel));
+    }
+
+    #[test]
+    fn parses_fedora_os_release() {
+        let os_release = "ID=fedora\nVERSION_ID=44\n";
         assert_eq!(os_release_distro(os_release), Some(Distro::Rhel));
     }
 
