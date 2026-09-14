@@ -941,7 +941,7 @@ fn resolve_guest_dns_server() -> Ipv4Addr {
         }
     }
 
-    let fallback = Ipv4Addr::new(8, 8, 8, 8);
+    let fallback = Ipv4Addr::new(1, 1, 1, 1);
     warn!(dns = %fallback, "falling back to public DNS for guest network");
     fallback
 }
@@ -969,7 +969,9 @@ fn parse_nameserver_ipv4(contents: &str) -> Option<Ipv4Addr> {
             Err(_) => continue,
         };
 
-        if ip.is_loopback() || ip.is_unspecified() {
+        // Host-local stubs and the sing-box TUN peer are not reachable DNS
+        // listeners from the guest network namespace.
+        if ip.is_loopback() || ip.is_unspecified() || ip.octets()[..2] == [172, 19] {
             continue;
         }
 
