@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
 use nix::sched::{setns, CloneFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -143,14 +144,64 @@ async fn exchange(query: &[u8], server: SocketAddr, tcp: bool) -> Result<Vec<u8>
     Ok(response)
 }
 
-async fn forward(query: &[u8], tcp: bool) -> Result<Vec<u8>> {
-    for server in host_nameservers().await? {
+fn dns_error(query: &Message, code: ResponseCode) -> Result<Vec<u8>> {
+    let mut response = Message::error_msg(query.metadata.id, query.metadata.op_code, code);
+    response.queries = query.queries.clone();
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.edns = query.edns.clone();
+    Ok(response.to_vec()?)
+}
+
+fn checked_response(query: &Message, wire: Vec<u8>, tcp: bool) -> Result<Option<Vec<u8>>> {
+    let response = Message::from_vec(&wire)?;
+    anyhow::ensure!(
+        response.metadata.message_type == MessageType::Response
+            && response.metadata.id == query.metadata.id
+            && response.metadata.op_code == query.metadata.op_code
+            && response.queries == query.queries,
+        "DNS response does not match question"
+    );
+    if matches!(
+        response.metadata.response_code,
+        ResponseCode::ServFail | ResponseCode::Refused
+    ) {
+        return Ok(None);
+    }
+    if !tcp && wire.len() > usize::from(query.max_payload()) {
+        return Ok(Some(response.truncate().to_vec()?));
+    }
+    // Preserve host answers byte-for-byte, including FakeIP mappings, DNSSEC,
+    // negative answers and TTLs. Do not cache independently of the host resolver.
+    Ok(Some(wire))
+}
+
+async fn forward_to(query: &[u8], tcp: bool, servers: &[SocketAddr]) -> Result<Vec<u8>> {
+    let message = Message::from_vec(query)?;
+    anyhow::ensure!(
+        message.metadata.message_type == MessageType::Query,
+        "not a DNS query"
+    );
+    if message.queries.len() != 1 {
+        return dns_error(&message, ResponseCode::FormErr);
+    }
+    for &server in servers {
         match tokio::time::timeout(QUERY_TIMEOUT, exchange(query, server, tcp)).await {
-            Ok(Ok(response)) => return Ok(response),
+            Ok(Ok(response)) => match checked_response(&message, response, tcp) {
+                Ok(Some(response)) => return Ok(response),
+                result => debug!(%server, ?result, "host DNS response unavailable"),
+            },
             result => debug!(%server, ?result, "host DNS exchange failed"),
         }
     }
-    anyhow::bail!("host DNS servers unavailable")
+    dns_error(&message, ResponseCode::ServFail)
+}
+
+async fn forward(query: &[u8], tcp: bool) -> Result<Vec<u8>> {
+    // Resolver ownership stays with the host (systemd-resolved/sing-box). Do not
+    // substitute public DNS if its configuration is temporarily unavailable.
+    let servers = host_nameservers().await.unwrap_or_default();
+    forward_to(query, tcp, &servers).await
 }
 
 async fn serve(udp: UdpSocket, tcp: TcpListener, mut stopped: oneshot::Receiver<()>) {
@@ -163,7 +214,16 @@ async fn serve(udp: UdpSocket, tcp: TcpListener, mut stopped: oneshot::Receiver<
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             result = udp.recv_from(&mut buffer) => {
                 let Ok((len, peer)) = result else { break; };
-                if tasks.len() >= MAX_IN_FLIGHT { continue; }
+                if tasks.len() >= MAX_IN_FLIGHT {
+                    if let Ok(message) = Message::from_vec(&buffer[..len]) {
+                        if message.metadata.message_type == MessageType::Query {
+                            if let Ok(reply) = dns_error(&message, ResponseCode::Refused) {
+                                let _ = udp.send_to(&reply, peer).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let query = buffer[..len].to_vec();
                 let udp = udp.clone();
                 tasks.spawn(async move {
@@ -203,6 +263,91 @@ async fn serve(udp: UdpSocket, tcp: TcpListener, mut stopped: oneshot::Receiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use hickory_resolver::proto::op::Query;
+    use hickory_resolver::proto::rr::{rdata::A, Name, RData, Record, RecordType};
+
+    fn query() -> Message {
+        let mut query = Message::query();
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(
+            Name::from_ascii("proxy.example.").unwrap(),
+            RecordType::A,
+        ));
+        query
+    }
+
+    async fn upstream(reply: Vec<u8>) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&reply, peer).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn falls_back_on_refusal_and_preserves_host_fakeip() -> Result<()> {
+        let query = query();
+        let first = upstream(dns_error(&query, ResponseCode::Refused)?).await;
+        let mut answer = Message::from_vec(&dns_error(&query, ResponseCode::NoError)?)?;
+        answer.add_answer(Record::from_rdata(
+            query.queries[0].name().clone(),
+            15,
+            RData::A(A(Ipv4Addr::new(198, 18, 0, 7))),
+        ));
+        let wire = answer.to_vec()?;
+        let second = upstream(wire.clone()).await;
+        assert_eq!(
+            forward_to(&query.to_vec()?, false, &[first, second]).await?,
+            wire
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_returns_servfail_without_public_fallback() -> Result<()> {
+        let query = query();
+        let response = Message::from_vec(&forward_to(&query.to_vec()?, false, &[]).await?)?;
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.queries, query.queries);
+        assert_eq!(response.metadata.id, query.metadata.id);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_question_with_same_transaction_id() -> Result<()> {
+        let query = query();
+        let mut response = Message::from_vec(&dns_error(&query, ResponseCode::NoError)?)?;
+        response.queries = vec![Query::query(
+            Name::from_ascii("other.example.")?,
+            RecordType::A,
+        )];
+        assert!(checked_response(&query, response.to_vec()?, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_udp_answer_truncates_for_tcp_retry() -> Result<()> {
+        let query = query();
+        let mut response = Message::from_vec(&dns_error(&query, ResponseCode::NoError)?)?;
+        for octet in 1..80 {
+            response.add_answer(Record::from_rdata(
+                query.queries[0].name().clone(),
+                15,
+                RData::A(A(Ipv4Addr::new(198, 18, 0, octet))),
+            ));
+        }
+        let wire = response.to_vec()?;
+        assert!(wire.len() > 512);
+        let udp = checked_response(&query, wire.clone(), false)?.unwrap();
+        assert!(udp.len() <= 512);
+        assert!(Message::from_vec(&udp)?.metadata.truncation);
+        assert_eq!(checked_response(&query, wire.clone(), true)?, Some(wire));
+        Ok(())
+    }
 
     #[test]
     fn host_stub_and_ipv6_are_preserved() {

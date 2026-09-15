@@ -80,7 +80,15 @@ back to the host namespace before creating upstream sockets. It forwards raw DNS
 messages to the nameservers in the host's `/etc/resolv.conf`, including a local
 systemd-resolved stub, preserving the host's split DNS and response record types.
 It rereads upstream configuration for each query and supports UDP and TCP, with
-bounded concurrency and timeouts. Slot teardown stops the worker and cancels its
+bounded concurrency and timeouts. Hickory parses DNS messages and validates the
+response question as well as its transaction ID. SERVFAIL/REFUSED responses try
+the next configured host nameserver; exhaustion returns SERVFAIL to the guest.
+UDP replies exceeding the client's advertised EDNS limit are truncated for TCP
+retry. Valid answers, including negative answers, DNSSEC and sing-box FakeIP
+records, retain the host's wire data and TTLs. There is no independent cache or
+public-DNS fallback: host resolver policy and proxy address mappings remain the
+source of truth. This follows the host-loopback upstream model of Docker's
+embedded DNS, rather than implementing a separate recursive resolver. Slot teardown stops the worker and cancels its
 in-flight requests; warm-slot reuse retains it. DNS resolution does not grant
 access to addresses rejected by the sandbox egress policy.
 
