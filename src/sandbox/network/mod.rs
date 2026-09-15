@@ -1,4 +1,5 @@
 mod address_plan;
+mod dns_proxy;
 mod egress_proxy;
 mod iptables_util;
 mod manager;

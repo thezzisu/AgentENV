@@ -22,6 +22,7 @@ use rtnetlink::packet_core::{
 use rtnetlink::{new_connection, Handle};
 use tracing::{debug, info, warn};
 
+use super::dns_proxy::{DnsProxy, DNS_PORT};
 use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
@@ -61,6 +62,7 @@ pub(crate) struct Slot {
     netns_dir: PathBuf,
     egress_proxy: Arc<EgressProxy>,
     cleanup_armed: bool,
+    dns_proxy: Option<DnsProxy>,
     /// Whether this namespace's user egress chain currently contains rules.
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
     /// clear rules left by the previous tenant.
@@ -111,6 +113,7 @@ impl Slot {
             netns_dir,
             egress_proxy,
             cleanup_armed: false,
+            dns_proxy: None,
             user_egress_rules_present: false,
         })
     }
@@ -182,6 +185,10 @@ impl Slot {
         // Reduce ARP retransmit delay on host-side veth to avoid resume tail latency (issue #272).
         let veth_name = Self::host_veth_name(idx);
         Self::tune_neigh_retrans_time_ms(&veth_name);
+        self.dns_proxy = Some(
+            DnsProxy::start(&self.namespace_path(), self.address_plan.tap_ip())
+                .map_err(NetworkError::NamespaceError)?,
+        );
 
         Ok(())
     }
@@ -268,6 +275,7 @@ impl Slot {
             host_interaction_ip,
             veth_vm_ip,
             address_plan.vm_ip(),
+            address_plan.tap_ip(),
             &address_plan.internal_egress_denied_cidrs(),
         )
     }
@@ -449,7 +457,7 @@ impl Slot {
     }
 
     pub(crate) fn guest_dns_server(&self) -> Ipv4Addr {
-        resolve_guest_dns_server()
+        self.address_plan.tap_ip()
     }
 
     pub(crate) fn namespace_path(&self) -> std::path::PathBuf {
@@ -528,6 +536,7 @@ impl Slot {
         host_interaction_ip: Ipv4Addr,
         veth_vm_ip: Ipv4Addr,
         vm_ip: Ipv4Addr,
+        tap_ip: Ipv4Addr,
         internal_egress_denied_cidrs: &[String],
     ) -> Result<()> {
         let commands = [
@@ -569,7 +578,16 @@ impl Slot {
         ];
 
         apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)?;
-        initialize_namespace_egress_chain(resolve_guest_dns_server(), internal_egress_denied_cidrs)
+        // Intercept DNS from old snapshots too: they retain the nameserver
+        // selected on their original host. Only guest-origin DNS is redirected.
+        let dns_rules = ["udp", "tcp"].map(|protocol| IptablesRestoreCommand::Insert {
+            table: "nat",
+            chain: "PREROUTING",
+            position: 1,
+            rule: format!("-i tap0 -p {protocol} --dport 53 -j REDIRECT --to-ports {DNS_PORT}"),
+        });
+        apply_iptables_commands(&dns_rules, OpenFailurePolicy::ReturnErr)?;
+        initialize_namespace_egress_chain(tap_ip, internal_egress_denied_cidrs)
     }
 
     fn tune_neigh_retrans_time_ms(interface: &str) {
@@ -843,6 +861,7 @@ impl Slot {
         // A namespace-local listener pins the namespace. Stop proxy acceptance
         // before removing the veth and unmounting the namespace, including
         // panic/drop cleanup paths that bypass the normal release path.
+        self.dns_proxy.take();
         self.egress_proxy.teardown(self.host_interaction_ip);
 
         // 1. Delete Host Veth Interface (this destroys the pair)
@@ -930,55 +949,6 @@ impl Drop for Slot {
             warn!(slot = self.idx, error = %e, "slot drop cleanup failed");
         }
     }
-}
-
-fn resolve_guest_dns_server() -> Ipv4Addr {
-    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Some(ip) = parse_nameserver_ipv4(&contents) {
-                return ip;
-            }
-        }
-    }
-
-    let fallback = Ipv4Addr::new(1, 1, 1, 1);
-    warn!(dns = %fallback, "falling back to public DNS for guest network");
-    fallback
-}
-
-fn parse_nameserver_ipv4(contents: &str) -> Option<Ipv4Addr> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let Some(directive) = parts.next() else {
-            continue;
-        };
-        if directive != "nameserver" {
-            continue;
-        }
-
-        let Some(candidate) = parts.next() else {
-            continue;
-        };
-        let ip = match candidate.parse::<Ipv4Addr>() {
-            Ok(ip) => ip,
-            Err(_) => continue,
-        };
-
-        // Host-local stubs and the sing-box TUN peer are not reachable DNS
-        // listeners from the guest network namespace.
-        if ip.is_loopback() || ip.is_unspecified() || ip.octets()[..2] == [172, 19] {
-            continue;
-        }
-
-        return Some(ip);
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1078,51 +1048,6 @@ mod tests {
             }
             _ => panic!("Expected SlotOutOfRange error"),
         }
-    }
-
-    #[test]
-    fn parse_nameserver_ipv4_prefers_non_loopback_ipv4() {
-        let conf = r#"
-            # generated by systemd-resolved
-            nameserver 127.0.0.53
-            nameserver 10.0.0.2
-            nameserver 8.8.8.8
-        "#;
-        assert_eq!(
-            parse_nameserver_ipv4(conf),
-            Some(Ipv4Addr::new(10, 0, 0, 2))
-        );
-    }
-
-    #[test]
-    fn parse_nameserver_ipv4_ignores_non_ipv4_entries() {
-        let conf = r#"
-            nameserver ::1
-            nameserver not_an_ip
-            search example.com
-        "#;
-        assert_eq!(parse_nameserver_ipv4(conf), None);
-    }
-
-    #[test]
-    fn parse_nameserver_ipv4_accepts_link_local_dns() {
-        let conf = "nameserver 169.254.169.253\n";
-        assert_eq!(
-            parse_nameserver_ipv4(conf),
-            Some(Ipv4Addr::new(169, 254, 169, 253))
-        );
-    }
-
-    #[test]
-    fn parse_nameserver_ipv4_skips_malformed_nameserver_lines() {
-        let conf = r#"
-            nameserver
-            nameserver 10.1.2.1
-        "#;
-        assert_eq!(
-            parse_nameserver_ipv4(conf),
-            Some(Ipv4Addr::new(10, 1, 2, 1))
-        );
     }
 
     #[test]

@@ -64,9 +64,25 @@ The process contains one global `NetworkManager` and one global `EgressProxy` re
 - `veth_host_ip` and `veth_vm_ip`: the two endpoints of the slot's `/31` veth link. The host endpoint is assigned to `veth-{slot}` and the namespace endpoint is assigned to `vpeer`.
 - `vm_ip` and `tap_ip`: fixed endpoints of the VM link on `vm_link_cidr`. The VM receives `vm_ip`; the namespace TAP interface receives `tap_ip`.
 
-The namespace adds a default route through `veth_host_ip`. Firecracker receives an `ip=` boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.
+The namespace adds a default route through `veth_host_ip`. Firecracker receives an `ip=` boot argument containing the VM address, TAP link, netmask, and the namespace TAP address as its DNS server.
 
 The complete internal pools are denied before user egress rules. This prevents a sandbox from reaching another slot's host-interaction address, veth link, or VM link even when a user policy otherwise allows the destination.
+
+## Guest DNS
+
+Each slot owns UDP and TCP DNS sockets bound to its TAP address on port 1053.
+Namespace NAT redirects guest-origin port 53 traffic to these sockets, including
+queries to the old nameserver retained by a snapshot. New cold boots advertise
+the TAP address as the nameserver. Guest loopback nameservers cannot be intercepted.
+
+The worker binds its listening sockets inside the slot namespace, then switches
+back to the host namespace before creating upstream sockets. It forwards raw DNS
+messages to the nameservers in the host's `/etc/resolv.conf`, including a local
+systemd-resolved stub, preserving the host's split DNS and response record types.
+It rereads upstream configuration for each query and supports UDP and TCP, with
+bounded concurrency and timeouts. Slot teardown stops the worker and cancels its
+in-flight requests; warm-slot reuse retains it. DNS resolution does not grant
+access to addresses rejected by the sandbox egress policy.
 
 ## Namespace Setup
 
@@ -78,6 +94,7 @@ The complete internal pools are denied before user egress rules. This prevents a
 4. Configure `lo`, `vpeer`, `tap0`, addresses, link state, and the namespace default route.
 5. Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.
 6. Configure the host veth address and a host route for the slot's `host_interaction_ip`.
+7. Start the slot DNS worker; startup failure fails slot creation.
 
 The baseline namespace rules are installed once during setup. Per-sandbox user rules and proxy redirects are replaced later by `set_egress_policy()`.
 
@@ -123,13 +140,14 @@ Host-side proxy and envd traffic targets the slot's `host_interaction_ip`. Names
 
 ```text
 INPUT      -i veth-+ -s <host_interaction_cidr> -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i veth-+ -s <host_interaction_cidr> -m conntrack --ctstate DNAT -j ACCEPT
 INPUT      -i veth-+ -s <host_interaction_cidr> -j REJECT
 FORWARD    -i veth-+ -s <host_interaction_cidr> -j ACCEPT
 FORWARD    -o veth-+ -d <host_interaction_cidr> --state ESTABLISHED,RELATED -j ACCEPT
 POSTROUTING -s <host_interaction_cidr> -j MASQUERADE
 ```
 
-The `INPUT` pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The `FORWARD` and `MASQUERADE` rules handle namespace-to-internet forwarding after namespace SNAT.
+The `INPUT` rules prevent guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. Host-managed DNAT/REDIRECT connections are accepted for transparent proxies; their original destination has already passed namespace egress policy. The `FORWARD` and `MASQUERADE` rules handle namespace-to-internet forwarding after namespace SNAT.
 
 ## Namespace Firewall
 

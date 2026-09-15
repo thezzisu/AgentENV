@@ -577,7 +577,7 @@ impl NetworkManager {
 
 fn global_host_iptables_commands(
     host_interaction_cidr: Ipv4Network,
-) -> [IptablesRestoreCommand; 5] {
+) -> [IptablesRestoreCommand; 6] {
     let cidr = host_interaction_cidr.to_string();
     [
         // Guest replies to host-initiated proxy/envd connections must remain
@@ -590,10 +590,18 @@ fn global_host_iptables_commands(
                 "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
             ),
         },
+        // Host-configured transparent proxies REDIRECT public traffic into
+        // INPUT. The original destination has already passed namespace policy.
         IptablesRestoreCommand::Insert {
             table: "filter",
             chain: "INPUT",
             position: 2,
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate DNAT -j ACCEPT"),
+        },
+        IptablesRestoreCommand::Insert {
+            table: "filter",
+            chain: "INPUT",
+            position: 3,
             rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j REJECT"),
         },
         // Packets are SNATted to the host interaction CIDR inside the sandbox namespace before
@@ -621,7 +629,7 @@ fn global_host_iptables_commands(
 
 fn global_host_iptables_delete_commands(
     host_interaction_cidr: Ipv4Network,
-) -> [IptablesRestoreCommand; 5] {
+) -> [IptablesRestoreCommand; 6] {
     let cidr = host_interaction_cidr.to_string();
     [
         IptablesRestoreCommand::Delete {
@@ -630,6 +638,11 @@ fn global_host_iptables_delete_commands(
             rule: format!(
                 "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
             ),
+        },
+        IptablesRestoreCommand::Delete {
+            table: "filter",
+            chain: "INPUT",
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate DNAT -j ACCEPT"),
         },
         IptablesRestoreCommand::Delete {
             table: "filter",
