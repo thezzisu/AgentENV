@@ -12,6 +12,7 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -20,6 +21,8 @@ crossterm = "0.28"
 directories = "5"
 envd = { path = "../../thirdparty/envd" }
 futures = "0.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.17"
 openssl-sys = { version = "0.9", optional = true }
 prost = "0.14"

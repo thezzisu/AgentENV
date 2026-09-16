@@ -37,7 +37,7 @@ enum Cmd {
     /// Generate shell completion scripts
     #[command(hide = true)]
     Completion(commands::completion::Args),
-    /// Attach an interactive shell to a running sandbox
+    /// Attach an interactive shell or a browser desktop to a sandbox
     #[command(visible_alias = "cn")]
     Connect(commands::connect::Args),
     /// Pause a running sandbox

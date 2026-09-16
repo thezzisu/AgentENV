@@ -5,6 +5,7 @@ pub mod connect;
 pub mod delete;
 pub mod download;
 pub mod exec;
+pub mod gui;
 pub mod list;
 pub mod pause;
 pub mod pull;

@@ -40,6 +40,7 @@ name = "aenv"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "chrono",
  "clap",
@@ -48,6 +49,8 @@ dependencies = [
  "directories",
  "envd",
  "futures",
+ "hyper 1.9.0",
+ "hyper-util",
  "indicatif",
  "openssl-sys",
  "prost",

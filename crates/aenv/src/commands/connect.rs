@@ -42,11 +42,28 @@ const SANDBOX_LOST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Args {
     #[arg(add = crate::commands::completion::add_active_sandbox_candidates())]
     sandbox_id: String,
+    /// Open the sandbox desktop through a temporary localhost forward
+    #[arg(long)]
+    gui: bool,
+    /// Desktop HTTP/WebSocket port inside the sandbox
+    #[arg(long, default_value_t = 6900, requires = "gui", value_parser = clap::value_parser!(u16).range(1..))]
+    gui_port: u16,
+    /// Print the desktop URL without opening a browser
+    #[arg(long, requires = "gui")]
+    no_open: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
     let rt = super::tokio_rt()?;
+    if args.gui {
+        return rt.block_on(super::gui::attach(
+            client,
+            args.sandbox_id,
+            args.gui_port,
+            !args.no_open,
+        ));
+    }
     let code = rt.block_on(attach(&client, &args.sandbox_id))?;
     std::process::exit(code);
 }

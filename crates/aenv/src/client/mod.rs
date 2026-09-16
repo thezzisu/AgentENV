@@ -64,6 +64,10 @@ impl Client {
         Transport::new(&self.base, sandbox_id, envd_access_token)
     }
 
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
