@@ -328,24 +328,6 @@ impl SandboxBackend for FirecrackerSandbox {
         FirecrackerSandbox::wait_for_ready(self).await
     }
 
-    async fn prepare_for_capture(&mut self) -> Result<()> {
-        let Some(envd) = self.envd_instance.clone() else {
-            return Ok(());
-        };
-        let output = Self::run_guest_command(
-            envd,
-            "/agentenv/bin/busybox".to_string(),
-            vec!["killall".to_string(), "qemu-system-x86_64".to_string()],
-        )
-        .await?;
-        if output.exit_code != 0 {
-            debug!(stderr = %output.stderr.trim(), "no nested qemu process was stopped before outer capture");
-        } else {
-            info!("stopped nested qemu processes before outer capture");
-        }
-        Ok(())
-    }
-
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
     async fn pause(
         &mut self,
@@ -607,6 +589,40 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// The bundled Firecracker cannot restore nested vCPU state. Terminate KVM
+    /// owners in the guest PID namespace and verify release before capture.
+    /// A failed guard must propagate; capturing anyway can strand envd on resume.
+    async fn prepare_for_capture(&self) -> Result<()> {
+        let envd = self
+            .envd_instance
+            .clone()
+            .context("cannot stop nested VMs because envd is not running")?;
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            Executor::new(envd)
+                .with_root_user()
+                .run_command_with_opts(
+                    "/agentenv/bin/busybox",
+                    &["sh", "-c", include_str!("stop_nested_vms.sh")],
+                    &crate::sandbox::ProcessOpts::default()
+                        .with_cwd("/")
+                        .with_timeout(std::time::Duration::from_secs(25)),
+                )
+                .await
+        })
+        .await
+        .context("stopping nested VMs before capture timed out")??;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "refusing capture: nested VM cleanup failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+        if !output.stdout.trim().is_empty() {
+            info!(processes = %output.stdout.trim(), "stopped nested VMs before capture");
+        }
+        Ok(())
+    }
+
     async fn recover_capture_failure<T>(
         &mut self,
         operation: &'static str,
@@ -1097,6 +1113,7 @@ impl FirecrackerSandbox {
                 .context("cannot flush writable volumes because envd is not running")?;
             Self::sync_writable_volume_filesystems(envd).await?;
         }
+        self.prepare_for_capture().await?;
         self.fc_instance.pause().await?;
 
         tokio::fs::create_dir_all(snapshot_dir)
@@ -2995,6 +3012,20 @@ mod tests {
             .await
             .expect_err("envd should be missing");
         assert!(err.to_string().contains("envd instance not initialized"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_refuses_to_create_artifacts_when_nested_cleanup_cannot_run() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        let root = TempDir::new()?;
+        let destination = root.path().join("snapshot");
+        let error = sandbox
+            .pause_to_dir(&destination)
+            .await
+            .expect_err("capture requires envd to verify nested KVM cleanup");
+        assert!(error.to_string().contains("envd is not running"));
+        assert!(!destination.exists());
         Ok(())
     }
 
