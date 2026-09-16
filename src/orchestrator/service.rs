@@ -730,6 +730,9 @@ where
         // This is a single operation that will return a list of results for each child sandbox.
         let fork_result = {
             let mut sandbox = source_handle.lock().await;
+            if let Err(error) = sandbox.prepare_for_capture().await {
+                warn!(%error, "failed to stop nested virtual machines before fork");
+            }
             sandbox.fork(&backend_specs).await
         };
         let forked_backends = match fork_result {
@@ -1428,6 +1431,12 @@ where
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
+            let mut sandbox = handle.lock().await;
+            if let Err(error) = sandbox.prepare_for_capture().await {
+                warn!(%error, "failed to stop nested virtual machines before pause");
+            }
+        }
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1897,6 +1906,9 @@ where
         let handle = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;
+            if let Err(error) = sandbox.prepare_for_capture().await {
+                warn!(%error, "failed to stop nested virtual machines before snapshot");
+            }
             sandbox.snapshot().await
         };
         let captured_snapshot = match result {

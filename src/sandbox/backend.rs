@@ -195,6 +195,13 @@ pub trait SandboxBackend: Send + 'static {
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
 
+    /// Stop optional nested virtual machines before capturing outer VM state.
+    /// Backends that cannot preserve nested KVM state may use this hook to
+    /// leave the guest in a resumable state. The default is a no-op.
+    async fn prepare_for_capture(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Pause the sandbox and capture its state for later resume.
     ///
     /// After this call the caller is expected to invoke [`stop`][Self::stop]

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -326,6 +326,24 @@ impl SandboxBackend for FirecrackerSandbox {
 
     async fn wait_for_ready(&self) -> Result<()> {
         FirecrackerSandbox::wait_for_ready(self).await
+    }
+
+    async fn prepare_for_capture(&mut self) -> Result<()> {
+        let Some(envd) = self.envd_instance.clone() else {
+            return Ok(());
+        };
+        let output = Self::run_guest_command(
+            envd,
+            "/agentenv/bin/busybox".to_string(),
+            vec!["killall".to_string(), "qemu-system-x86_64".to_string()],
+        )
+        .await?;
+        if output.exit_code != 0 {
+            debug!(stderr = %output.stderr.trim(), "no nested qemu process was stopped before outer capture");
+        } else {
+            info!("stopped nested qemu processes before outer capture");
+        }
+        Ok(())
     }
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
